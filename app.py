@@ -355,24 +355,39 @@ with pages[1]:
 
 with pages[2]:
     st.subheader("Testportfölj – inga riktiga order")
+    st.caption("Inköpskursen föreslås automatiskt från senaste tillgängliga dagskurs. Kontrollera kurs och datum innan du sparar en simulering.")
     wl = read_watchlist()
+    opts = {f"{r['name']} ({r['ticker']})": (r["name"], r["ticker"]) for _, r in wl.iterrows()}
+    selected = st.selectbox("Aktie", list(opts.keys()), key="paper_trade_stock")
+    name, ticker = opts[selected]
+
+    latest_price = np.nan
+    quote_history = load_history(ticker, "5d")
+    if not quote_history.empty:
+        latest_price = float(quote_history["Close"].dropna().iloc[-1])
+        latest_date = quote_history["Close"].dropna().index[-1].date()
+        st.caption(f"Senaste tillgängliga kurs från datakällan: {latest_price:.2f} kr ({latest_date}). Dagsdata kan vara fördröjd.")
+    else:
+        st.warning("Kunde inte hämta senaste kurs för vald aktie. Ange inköpskurs manuellt och kontrollera den mot en annan källa.")
+
     with st.form("add_trade"):
-        opts = {f"{r['name']} ({r['ticker']})": (r["name"], r["ticker"]) for _, r in wl.iterrows()}
-        selected = st.selectbox("Aktie", list(opts.keys()))
         a1, a2 = st.columns(2)
         invested = a1.number_input("Investerat belopp (kr)", min_value=1.0, value=1000.0, step=100.0)
-        buy_price = a2.number_input("Inköpskurs (kr per aktie)", min_value=0.01, value=100.0, step=1.0)
+        default_buy_price = float(latest_price) if pd.notna(latest_price) and latest_price > 0 else 100.0
+        buy_price = a2.number_input("Inköpskurs (kr per aktie)", min_value=0.01, value=default_buy_price, step=1.0, key=f"buy_price_{ticker}")
         a3, a4 = st.columns(2)
         buy_date = a3.date_input("Testdatum", value=date.today())
         stop_pct = a4.number_input("Stop-loss (%)", min_value=1.0, max_value=30.0, value=6.0, step=0.5)
         notes = st.text_input("Anteckning (valfritt)")
         submitted = st.form_submit_button("Spara testaffär", type="primary")
     if submitted:
-        name, ticker = opts[selected]
-        with db_connect() as con:
-            con.execute("INSERT INTO paper_trades(ticker,name,invested,buy_price,buy_date,stop_pct,notes) VALUES(?,?,?,?,?,?,?)",
-                        (ticker, name, invested, buy_price, buy_date.isoformat(), stop_pct, notes))
-        st.success("Testaffären sparades lokalt på den här datorn/servern.")
+        if buy_price <= 0:
+            st.error("Inköpskurs måste vara större än noll.")
+        else:
+            with db_connect() as con:
+                con.execute("INSERT INTO paper_trades(ticker,name,invested,buy_price,buy_date,stop_pct,notes) VALUES(?,?,?,?,?,?,?)",
+                            (ticker, name, invested, buy_price, buy_date.isoformat(), stop_pct, notes))
+            st.success("Testaffären sparades. Kontrollera att inköpskursen motsvarar din simulerade köpdag.")
     with db_connect() as con:
         trades = pd.read_sql_query("SELECT * FROM paper_trades ORDER BY active DESC, buy_date DESC", con)
     if trades.empty:
@@ -394,6 +409,8 @@ with pages[2]:
                            "Inköpskurs": t["buy_price"], "Senaste kurs": last, "Resultat kr": pl, "Resultat %": pct,
                            "Fast stop-loss": stop, "Datum": t["buy_date"], "Aktiv": bool(t["active"]), "Anteckning": t["notes"]})
         trade_df = pd.DataFrame(values)
+        if (trades["buy_price"].round(2) == 100.00).any():
+            st.warning("Minst en äldre testaffär har inköpskursen exakt 100 kr. Om du inte avsiktligt angav den kursen är resultatet för den affären missvisande. Avsluta/ta bort den och skapa en ny testaffär med rätt kurs.")
         st.dataframe(trade_df, use_container_width=True, hide_index=True, column_config={
             "Investerat kr": st.column_config.NumberColumn(format="%.2f kr"), "Inköpskurs": st.column_config.NumberColumn(format="%.2f kr"),
             "Senaste kurs": st.column_config.NumberColumn(format="%.2f kr"), "Resultat kr": st.column_config.NumberColumn(format="%+.2f kr"),
