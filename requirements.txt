@@ -4,3 +4,4 @@ numpy>=1.26
 yfinance>=0.2.50
 plotly>=5.24
 requests>=2.32
+supabase>=2.10

@@ -14,6 +14,11 @@ import requests
 import streamlit as st
 import yfinance as yf
 
+try:
+    from supabase import create_client
+except ImportError:
+    create_client = None
+
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "aktieapp.db"
 
@@ -88,6 +93,54 @@ def db_connect():
     con.execute("PRAGMA foreign_keys = ON")
     return con
 
+
+
+def get_supabase_client():
+    """Return a Supabase client when Streamlit secrets are configured; otherwise None."""
+    if create_client is None:
+        return None
+    try:
+        url = st.secrets.get("SUPABASE_URL", "")
+        key = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")
+        if url and key:
+            return create_client(url, key)
+    except Exception:
+        return None
+    return None
+
+
+def read_paper_trades() -> pd.DataFrame:
+    """Read paper trades from Supabase when configured, otherwise local SQLite."""
+    client = get_supabase_client()
+    if client is not None:
+        response = client.table("paper_trades").select("*").order("active", desc=True).order("buy_date", desc=True).execute()
+        return pd.DataFrame(response.data or [])
+    with db_connect() as con:
+        return pd.read_sql_query("SELECT * FROM paper_trades ORDER BY active DESC, buy_date DESC", con)
+
+
+def insert_paper_trade(ticker: str, name: str, invested: float, buy_price: float, buy_date: str, stop_pct: float, notes: str):
+    client = get_supabase_client()
+    payload = {
+        "ticker": ticker, "name": name, "invested": float(invested),
+        "buy_price": float(buy_price), "buy_date": str(buy_date),
+        "stop_pct": float(stop_pct), "notes": notes or "", "active": 1,
+    }
+    if client is not None:
+        client.table("paper_trades").insert(payload).execute()
+    else:
+        with db_connect() as con:
+            con.execute("INSERT INTO paper_trades(ticker,name,invested,buy_price,buy_date,stop_pct,notes) VALUES(?,?,?,?,?,?,?)",
+                        (ticker, name, invested, buy_price, str(buy_date), stop_pct, notes))
+
+
+def close_paper_trade(trade_id: int):
+    client = get_supabase_client()
+    if client is not None:
+        client.table("paper_trades").update({"active": 0}).eq("id", int(trade_id)).execute()
+    else:
+        with db_connect() as con:
+            con.execute("UPDATE paper_trades SET active=0 WHERE id=?", (int(trade_id),))
 
 def init_db():
     with db_connect() as con:
@@ -466,12 +519,17 @@ with pages[2]:
         if buy_price <= 0:
             st.error("Inköpskurs måste vara större än noll.")
         else:
-            with db_connect() as con:
-                con.execute("INSERT INTO paper_trades(ticker,name,invested,buy_price,buy_date,stop_pct,notes) VALUES(?,?,?,?,?,?,?)",
-                            (ticker, name, invested, buy_price, buy_date.isoformat(), stop_pct, notes))
+            try:
+                insert_paper_trade(ticker, name, invested, buy_price, buy_date.isoformat(), stop_pct, notes)
+            except Exception as e:
+                st.error(f"Kunde inte spara testaffären: {e}")
+                st.stop()
             st.success("Testaffären sparades. Kontrollera att inköpskursen motsvarar din simulerade köpdag.")
-    with db_connect() as con:
-        trades = pd.read_sql_query("SELECT * FROM paper_trades ORDER BY active DESC, buy_date DESC", con)
+    try:
+        trades = read_paper_trades()
+    except Exception as e:
+        st.error(f"Kunde inte läsa testportföljen från Supabase. Kontrollera tabellen och appens Secrets. Detalj: {e}")
+        trades = pd.DataFrame()
     if trades.empty:
         st.info("Inga testaffärer ännu. Lägg till en ovan.")
     else:
@@ -500,8 +558,12 @@ with pages[2]:
         ids = trades["id"].tolist()
         selected_id = st.selectbox("Markera testaffär som avslutad", options=ids, format_func=lambda x: f"ID {x}: {trades.loc[trades.id==x,'name'].iloc[0]}")
         if st.button("Avsluta vald testaffär"):
-            with db_connect() as con: con.execute("UPDATE paper_trades SET active=0 WHERE id=?", (int(selected_id),))
-            st.rerun()
+            try:
+                close_paper_trade(int(selected_id))
+                st.success("Testaffären markerades som avslutad.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Kunde inte avsluta testaffären: {e}")
         st.download_button("Ladda ned testportfölj som CSV", trade_df.to_csv(index=False).encode("utf-8-sig"), file_name="testportfolj.csv", mime="text/csv")
 
 with pages[3]:
